@@ -680,9 +680,9 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
 
 def train_loop(device, model, data_loaders, optimizer, writer, checkpoint_dir=None):
     if is_mulaw_quantize(hparams.input_type):
-        criterion = MaskedCrossEntropyLoss()
+        criterion = MaskedCrossEntropyLoss().cuda(gpu)
     else:
-        criterion = DiscretizedMixturelogisticLoss()
+        criterion = DiscretizedMixturelogisticLoss().cuda(gpu)
 
     if hparams.exponential_moving_average:
         ema = ExponentialMovingAverage(hparams.ema_decay)
@@ -849,7 +849,7 @@ def restore_parts(path, model):
                 warn("{}: may contain invalid size of weight. skipping...".format(k))
 
 
-def get_data_loaders(data_root, speaker_id, test_shuffle=True):
+def get_data_loaders(data_root, speaker_id, num_replicas, rank, test_shuffle=True):
     data_loaders = {}
     local_conditioning = hparams.cin_channels > 0
     for phase in ["train", "test"]:
@@ -873,19 +873,31 @@ def get_data_loaders(data_root, speaker_id, test_shuffle=True):
         print("[{}]: length of the dataset is {}".format(phase, len(X)))
 
         if train:
-            lengths = np.array(X.file_data_source.lengths)
-            # Prepare sampler
-            sampler = PartialyRandomizedSimilarTimeLengthSampler(
-                lengths, batch_size=hparams.batch_size)
+            # lengths = np.array(X.file_data_source.lengths)
+            # # Prepare sampler
+            # sampler = PartialyRandomizedSimilarTimeLengthSampler(
+            #     lengths, batch_size=hparams.batch_size)
             shuffle = False
+            # # make sure that there's no sorting bugs for https://github.com/r9y9/wavenet_vocoder/issues/130
+            # sampler_idx = np.asarray(sorted(list(map(lambda s: int(s), sampler))))
+            # assert (sampler_idx == np.arange(len(sampler_idx), dtype=np.int)).all()
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=num_replicas,
+                rank=rank
+            )
+        ################################################################
         else:
             sampler = None
             shuffle = test_shuffle
 
         dataset = PyTorchDataset(X, Mel)
+
+        ################################################################
+
         data_loader = data_utils.DataLoader(
             dataset, batch_size=hparams.batch_size,
-            num_workers=hparams.num_workers, sampler=sampler, shuffle=shuffle,
+            num_workers=0, sampler=sampler, shuffle=shuffle,
             collate_fn=collate_fn, pin_memory=hparams.pin_memory)
 
         speaker_ids = {}
@@ -902,24 +914,22 @@ def get_data_loaders(data_root, speaker_id, test_shuffle=True):
 
     return data_loaders
 
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn as nn
 
-if __name__ == "__main__":
-    args = docopt(__doc__)
-    print("Command line args:\n", args)
+def multi_train(gpu, args):
     checkpoint_dir = args["--checkpoint-dir"]
     checkpoint_path = args["--checkpoint"]
     checkpoint_restore_parts = args["--restore-parts"]
     speaker_id = args["--speaker-id"]
     speaker_id = int(speaker_id) if speaker_id is not None else None
     preset = args["--preset"]
-
     data_root = args["--data-root"]
     if data_root is None:
         data_root = join(dirname(__file__), "data", "ljspeech")
-
     log_event_path = args["--log-event-path"]
     reset_optimizer = args["--reset-optimizer"]
-
     # Load preset if specified
     if preset is not None:
         with open(preset) as f:
@@ -929,15 +939,36 @@ if __name__ == "__main__":
     assert hparams.name == "wavenet_vocoder"
     print(hparams_debug_string())
 
+    fs = hparams.sample_rate
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Dataloader setup
-    data_loaders = get_data_loaders(data_root, speaker_id, test_shuffle=True)
+    rank = gpu
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        world_size=hparams.num_workers,
+        rank=rank
+    )
 
     device = torch.device("cuda" if use_cuda else "cpu")
+    print('device')
+    print(device)
+    torch.cuda.set_device(gpu)
+
+    num_replicas = hparams.num_workers
+    # Dataloader setup
+    data_loaders = get_data_loaders(data_root, speaker_id, num_replicas, rank, test_shuffle=True)
 
     # Model
     model = build_model().to(device)
+
+
+    ###############################################################
+    # Wrap the model
+    model = nn.parallel.DistributedDataParallel(model,
+                                                device_ids=[gpu])
+    ###############################################################
+
 
     receptive_field = model.receptive_field
     print("Receptive field (samples / ms): {} / {}".format(
@@ -976,3 +1007,11 @@ if __name__ == "__main__":
     print("Finished")
 
     sys.exit(0)
+
+if __name__ == "__main__":
+    args = docopt(__doc__)
+    print("Command line args:\n", args)
+
+    os.environ['MASTER_ADDR'] = '10.57.23.164'
+    os.environ['MASTER_PORT'] = '8888'
+    mp.spawn(multi_train, nprocs=hparams.num_workers, args=(args,))
