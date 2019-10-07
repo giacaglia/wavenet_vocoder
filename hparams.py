@@ -28,11 +28,11 @@ hparams = tf.contrib.training.HParams(
     # this is only valid for mulaw is True
     silence_threshold=2,
     num_mels=80,
-    fmin=125,
+    fmin=55,
     fmax=7600,
-    fft_size=1024,
+    fft_size=1110,
     # shift can be specified by either hop_size or frame_shift_ms
-    hop_size=256,
+    hop_size=275,
     frame_shift_ms=None,
     min_level_db=-100,
     ref_level_db=20,
@@ -73,7 +73,7 @@ hparams = tf.contrib.training.HParams(
     # otherwise repeat features to adjust time resolution
     upsample_conditional_features=True,
     # should np.prod(upsample_scales) == hop_size
-    upsample_scales=[4, 4, 4, 4],
+    upsample_scales=[11, 25],
     # Freq axis kernel size for upsampling network
     freq_axis_kernel_size=3,
 
@@ -81,11 +81,11 @@ hparams = tf.contrib.training.HParams(
     # currently limited for speaker embedding
     # this should only be enabled for multi-speaker dataset
     gin_channels=-1,  # i.e., speaker embedding dim
-    n_speakers=7,  # 7 for CMU ARCTIC
+    n_speakers=1,  # 7 for CMU ARCTIC
 
     # Data loader
     pin_memory=True,
-    num_workers=2,
+    num_workers=4,
 
     # train/test
     # test size can be specified as portion or num samples
@@ -96,7 +96,7 @@ hparams = tf.contrib.training.HParams(
     # Loss
 
     # Training:
-    batch_size=2,
+    batch_size=8,
     adam_beta1=0.9,
     adam_beta2=0.999,
     adam_eps=1e-8,
@@ -124,7 +124,6 @@ hparams = tf.contrib.training.HParams(
     # per-epoch interval
     test_eval_epoch_interval=5,
     save_optimizer_state=True,
-
     # Eval:
 )
 
