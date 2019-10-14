@@ -70,7 +70,7 @@ if use_cuda:
 
 
 def sanity_check(model, c, g):
-    if model.has_speaker_embedding():
+    if model.module.has_speaker_embedding():
         if g is None:
             raise RuntimeError(
                 "WaveNet expects speaker embedding, but speaker-id is not provided")
@@ -79,7 +79,7 @@ def sanity_check(model, c, g):
             raise RuntimeError(
                 "WaveNet expects no speaker embedding, but speaker-id is provided")
 
-    if model.local_conditioning_enabled():
+    if model.module.local_conditioning_enabled():
         if c is None:
             raise RuntimeError("WaveNet expects conditional features, but not given")
     else:
@@ -678,11 +678,11 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
     return loss.item()
 
 
-def train_loop(device, model, data_loaders, optimizer, writer, checkpoint_dir=None):
+def train_loop(device, model, data_loaders, optimizer, writer, gpu, checkpoint_dir=None):
     if is_mulaw_quantize(hparams.input_type):
-        criterion = MaskedCrossEntropyLoss()
+        criterion = MaskedCrossEntropyLoss().cuda(gpu)
     else:
-        criterion = DiscretizedMixturelogisticLoss()
+        criterion = DiscretizedMixturelogisticLoss().cuda(gpu)
 
     if hparams.exponential_moving_average:
         ema = ExponentialMovingAverage(hparams.ema_decay)
@@ -849,7 +849,7 @@ def restore_parts(path, model):
                 warn("{}: may contain invalid size of weight. skipping...".format(k))
 
 
-def get_data_loaders(data_root, speaker_id, test_shuffle=True):
+def get_data_loaders(data_root, speaker_id, num_replicas, rank, test_shuffle=True):
     data_loaders = {}
     local_conditioning = hparams.cin_channels > 0
     for phase in ["train", "test"]:
@@ -872,38 +872,48 @@ def get_data_loaders(data_root, speaker_id, test_shuffle=True):
             Mel = None
         print("[{}]: length of the dataset is {}".format(phase, len(X)))
 
+        dataset = PyTorchDataset(X, Mel)
         if train:
-            lengths = np.array(X.file_data_source.lengths)
+            #lengths = np.array(X.file_data_source.lengths)
             # Prepare sampler
-            sampler = PartialyRandomizedSimilarTimeLengthSampler(
-                lengths, batch_size=hparams.batch_size)
+            #sampler = PartialyRandomizedSimilarTimeLengthSampler(
+            #    lengths, batch_size=hparams.batch_size)
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=num_replicas,
+                rank=rank
+            )
             shuffle = False
         else:
             sampler = None
             shuffle = test_shuffle
 
-        dataset = PyTorchDataset(X, Mel)
         data_loader = data_utils.DataLoader(
             dataset, batch_size=hparams.batch_size,
-            num_workers=hparams.num_workers, sampler=sampler, shuffle=shuffle,
+            num_workers=0, sampler=sampler, shuffle=shuffle,
             collate_fn=collate_fn, pin_memory=hparams.pin_memory)
-
         speaker_ids = {}
+
         for idx, (x, c, g) in enumerate(dataset):
+            print('idx')
+            print(idx)
             if g is not None:
                 try:
                     speaker_ids[g] += 1
                 except KeyError:
                     speaker_ids[g] = 1
+        print('after data loop')
         if len(speaker_ids) > 0:
             print("Speaker stats:", speaker_ids)
 
         data_loaders[phase] = data_loader
-
     return data_loaders
 
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn as nn
 
-if __name__ == "__main__":
+def multi_train(gpu, args):
     args = docopt(__doc__)
     print("Command line args:\n", args)
     checkpoint_dir = args["--checkpoint-dir"]
@@ -932,9 +942,22 @@ if __name__ == "__main__":
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Dataloader setup
-    data_loaders = get_data_loaders(data_root, speaker_id, test_shuffle=True)
+    rank = gpu
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        world_size=hparams.num_workers,
+        rank=rank
+    )
 
-    device = torch.device("cuda" if use_cuda else "cpu")
+    #print('HEREEEE 2')
+    device = torch.device("cuda:" + str(gpu) if use_cuda else "cpu")
+    print('device')
+    print(device)
+    torch.cuda.set_device(gpu)
+
+    num_replicas = hparams.num_workers
+
 
     # Model
     model = build_model().to(device)
@@ -942,19 +965,28 @@ if __name__ == "__main__":
     receptive_field = model.receptive_field
     print("Receptive field (samples / ms): {} / {}".format(
         receptive_field, receptive_field / fs * 1000))
-
+ 
     optimizer = optim.Adam(model.parameters(),
-                           lr=hparams.initial_learning_rate, betas=(
-        hparams.adam_beta1, hparams.adam_beta2),
-        eps=hparams.adam_eps, weight_decay=hparams.weight_decay,
-        amsgrad=hparams.amsgrad)
-
-    if checkpoint_restore_parts is not None:
-        restore_parts(checkpoint_restore_parts, model)
+            lr=hparams.initial_learning_rate, betas=(
+                hparams.adam_beta1, hparams.adam_beta2),
+            eps=hparams.adam_eps, weight_decay=hparams.weight_decay,
+            amsgrad=hparams.amsgrad)
 
     # Load checkpoints
     if checkpoint_path is not None:
         load_checkpoint(checkpoint_path, model, optimizer, reset_optimizer)
+   
+    ###############################################################
+    # Wrap the model
+    model = nn.parallel.DistributedDataParallel(model,
+        device_ids=[gpu])
+    ###############################################################
+
+    # Dataloader setup
+    data_loaders = get_data_loaders(data_root, speaker_id, num_replicas, rank, test_shuffle=True)
+
+    if checkpoint_restore_parts is not None:
+        restore_parts(checkpoint_restore_parts, model)
 
     # Setup summary writer for tensorboard
     if log_event_path is None:
@@ -964,7 +996,7 @@ if __name__ == "__main__":
 
     # Train!
     try:
-        train_loop(device, model, data_loaders, optimizer, writer,
+        train_loop(device, model, data_loaders, optimizer, writer, gpu,
                    checkpoint_dir=checkpoint_dir)
     except KeyboardInterrupt:
         print("Interrupted!")
@@ -976,3 +1008,11 @@ if __name__ == "__main__":
     print("Finished")
 
     sys.exit(0)
+
+if __name__ == "__main__":
+    args = docopt(__doc__)
+    print("Command line args:\n", args)
+
+    os.environ['MASTER_ADDR'] = '10.142.0.4'
+    os.environ['MASTER_PORT'] = '8888'
+    mp.spawn(multi_train, nprocs=hparams.num_workers, args=(args,)) 
