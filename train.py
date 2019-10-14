@@ -679,6 +679,9 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
 
 
 def train_loop(device, model, data_loaders, optimizer, writer, gpu, checkpoint_dir=None):
+    print('train loop')
+    print('gpu number: ')
+    print(gpu)
     if is_mulaw_quantize(hparams.input_type):
         criterion = MaskedCrossEntropyLoss().cuda(gpu)
     else:
