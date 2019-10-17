@@ -35,6 +35,10 @@ var/
 .installed.cfg
 *.egg
 venv/
+wandb/
+
+20180510_mixture_lj_checkpoint_step000320000_ema.json
+20180510_mixture_lj_checkpoint_step000320000_ema.pth
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

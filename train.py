@@ -68,7 +68,6 @@ use_cuda = torch.cuda.is_available()
 if use_cuda:
     cudnn.benchmark = False
 
-
 def sanity_check(model, c, g):
     if model.module.has_speaker_embedding():
         if g is None:
@@ -483,8 +482,8 @@ def save_waveplot(path, y_hat, y_target):
 def eval_model(global_step, writer, device, model, y, c, g, input_lengths, eval_dir, ema=None):
     if ema is not None:
         print("Using averaged model for evaluation")
-        model = clone_as_averaged_model(device, model, ema)
-        model.make_generation_fast_()
+        #model = clone_as_averaged_model(device, model, ema)
+        model.module.make_generation_fast_()
 
     model.eval()
     idx = np.random.randint(0, len(y))
@@ -523,7 +522,7 @@ def eval_model(global_step, writer, device, model, y, c, g, input_lengths, eval_
 
     # Run the model in fast eval mode
     with torch.no_grad():
-        y_hat = model.incremental_forward(
+        y_hat = model.module.incremental_forward(
             initial_input, c=c, g=g, T=length, softmax=True, quantize=True, tqdm=tqdm,
             log_scale_min=hparams.log_scale_min)
 
@@ -596,7 +595,7 @@ def save_states(global_step, writer, y_hat, y, input_lengths, checkpoint_dir=Non
 def __train_step(device, phase, epoch, global_step, global_test_step,
                  model, optimizer, writer, criterion,
                  x, y, c, g, input_lengths,
-                 checkpoint_dir, eval_dir=None, do_eval=False, ema=None):
+                 checkpoint_dir, eval_dir=None, do_eval=False, ema=None, gpu=0):
     sanity_check(model, c, g)
 
     # x : (B, C, T)
@@ -638,7 +637,8 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
 
     # multi gpu support
     # you must make sure that batch size % num gpu == 0
-    y_hat = torch.nn.parallel.data_parallel(model, (x, c, g, False))
+    #y_hat = torch.nn.parallel.data_parallel(model, (x, c, g, False))
+    y_hat = model(x,c,g,False)
 
     if is_mulaw_quantize(hparams.input_type):
         # wee need 4d inputs for spatial cross entropy loss
@@ -648,11 +648,12 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
     else:
         loss = criterion(y_hat[:, :, :-1], y[:, 1:, :], mask=mask)
 
-    if train and step > 0 and step % hparams.checkpoint_interval == 0:
+    #print('\nTrain step {} on device : {}'.format(step, gpu))
+    if train and step > 0 and step % hparams.checkpoint_interval == 0 and gpu == 0:
         save_states(step, writer, y_hat, y, input_lengths, checkpoint_dir)
         save_checkpoint(device, model, optimizer, step, checkpoint_dir, epoch, ema)
 
-    if do_eval:
+    if do_eval and gpu == 0:
         # NOTE: use train step (i.e., global_step) for filename
         eval_model(global_step, writer, device, model, y, c, g, input_lengths, eval_dir, ema)
 
@@ -669,11 +670,12 @@ def __train_step(device, phase, epoch, global_step, global_test_step,
                     ema.update(name, param.data)
 
     # Logs
-    writer.add_scalar("{} loss".format(phase), float(loss.item()), step)
-    if train:
-        if clip_thresh > 0:
-            writer.add_scalar("gradient norm", grad_norm, step)
-        writer.add_scalar("learning rate", current_lr, step)
+    if gpu == 0:
+        writer.add_scalar("{} loss".format(phase), float(loss.item()), step)
+        if train:
+            if clip_thresh > 0:
+                writer.add_scalar("gradient norm", grad_norm, step)
+            writer.add_scalar("learning rate", current_lr, step)
 
     return loss.item()
 
@@ -723,7 +725,7 @@ def train_loop(device, model, data_loaders, optimizer, writer, gpu, checkpoint_d
                 running_loss += __train_step(device,
                                              phase, global_epoch, global_step, global_test_step, model,
                                              optimizer, writer, criterion, x, y, c, g, input_lengths,
-                                             checkpoint_dir, eval_dir, do_eval, ema)
+                                             checkpoint_dir, eval_dir, do_eval, ema, gpu)
 
                 # update global state
                 if train:
@@ -733,10 +735,11 @@ def train_loop(device, model, data_loaders, optimizer, writer, gpu, checkpoint_d
 
             # log per epoch
             averaged_loss = running_loss / len(data_loader)
-            writer.add_scalar("{} loss (per epoch)".format(phase),
+            if writer:
+                writer.add_scalar("{} loss (per epoch)".format(phase),
                               averaged_loss, global_epoch)
-            print("Step {} [{}] Loss: {}".format(
-                global_step, phase, running_loss / len(data_loader)))
+            print("device {}: Step {} [{}] Loss: {}".format(
+                gpu, global_step, phase, running_loss / len(data_loader)))
 
         global_epoch += 1
 
@@ -753,7 +756,7 @@ def save_checkpoint(device, model, optimizer, step, checkpoint_dir, epoch, ema=N
         "global_epoch": epoch,
         "global_test_step": global_test_step,
     }, checkpoint_path)
-    print("Saved checkpoint:", checkpoint_path)
+    print("Saved checkpoint:{} on device: {}".format(checkpoint_path, device))
 
     if ema is not None:
         averaged_model = clone_as_averaged_model(device, model, ema)
@@ -855,6 +858,8 @@ def restore_parts(path, model):
 def get_data_loaders(data_root, speaker_id, num_replicas, rank, test_shuffle=True):
     data_loaders = {}
     local_conditioning = hparams.cin_channels > 0
+    print('bfeore file source dataset')
+
     for phase in ["train", "test"]:
         train = phase == "train"
         X = FileSourceDataset(RawAudioDataSource(data_root, speaker_id=speaker_id,
@@ -876,6 +881,7 @@ def get_data_loaders(data_root, speaker_id, num_replicas, rank, test_shuffle=Tru
         print("[{}]: length of the dataset is {}".format(phase, len(X)))
 
         dataset = PyTorchDataset(X, Mel)
+        print('before sampler')
         if train:
             #lengths = np.array(X.file_data_source.lengths)
             # Prepare sampler
@@ -898,7 +904,6 @@ def get_data_loaders(data_root, speaker_id, num_replicas, rank, test_shuffle=Tru
         speaker_ids = {}
 
         for idx, (x, c, g) in enumerate(dataset):
-            print('idx')
             print(idx)
             if g is not None:
                 try:
@@ -915,8 +920,10 @@ def get_data_loaders(data_root, speaker_id, num_replicas, rank, test_shuffle=Tru
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+import wandb
 
 def multi_train(gpu, args):
+    print('BEEEEFORE HERE')
     args = docopt(__doc__)
     print("Command line args:\n", args)
     checkpoint_dir = args["--checkpoint-dir"]
@@ -946,6 +953,7 @@ def multi_train(gpu, args):
 
     # Dataloader setup
     rank = gpu
+    print('num workers {}'.format(hparams.num_workers))
     dist.init_process_group(
         backend='nccl',
         init_method='env://',
@@ -955,12 +963,9 @@ def multi_train(gpu, args):
 
     #print('HEREEEE 2')
     device = torch.device("cuda:" + str(gpu) if use_cuda else "cpu")
-    print('device')
-    print(device)
     torch.cuda.set_device(gpu)
 
     num_replicas = hparams.num_workers
-
 
     # Model
     model = build_model().to(device)
@@ -975,28 +980,37 @@ def multi_train(gpu, args):
             eps=hparams.adam_eps, weight_decay=hparams.weight_decay,
             amsgrad=hparams.amsgrad)
 
+    print('after optimizer')
     # Load checkpoints
-    if checkpoint_path is not None:
-        load_checkpoint(checkpoint_path, model, optimizer, reset_optimizer)
+    #if checkpoint_path is not None and gpu == 0:
+        #load_checkpoint(checkpoint_path, model, optimizer, reset_optimizer)
    
+    print('before loading model')
     ###############################################################
     # Wrap the model
     model = nn.parallel.DistributedDataParallel(model,
-        device_ids=[gpu])
+        device_ids=[gpu], find_unused_parameters=True)
     ###############################################################
 
+    print('after loading model')
     # Dataloader setup
     data_loaders = get_data_loaders(data_root, speaker_id, num_replicas, rank, test_shuffle=True)
 
-    if checkpoint_restore_parts is not None:
+    print('after data loaders')
+
+    if checkpoint_restore_parts is not None and gpu == 0:
         restore_parts(checkpoint_restore_parts, model)
+
+    print('after restore parts')
 
     # Setup summary writer for tensorboard
     if log_event_path is None:
         log_event_path = "log/run-test" + str(datetime.now()).replace(" ", "_")
     print("TensorBoard event log path: {}".format(log_event_path))
-    writer = SummaryWriter(log_dir=log_event_path)
-
+    if gpu == 0:
+        writer = SummaryWriter(log_dir=log_event_path)
+    else:
+        writer = None
     # Train!
     try:
         train_loop(device, model, data_loaders, optimizer, writer, gpu,
@@ -1005,8 +1019,9 @@ def multi_train(gpu, args):
         print("Interrupted!")
         pass
     finally:
-        save_checkpoint(
-            device, model, optimizer, global_step, checkpoint_dir, global_epoch)
+        if gpu == 0:
+            save_checkpoint(
+                device, model, optimizer, global_step, checkpoint_dir, global_epoch)
 
     print("Finished")
 
