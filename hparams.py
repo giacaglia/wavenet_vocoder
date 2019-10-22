@@ -21,8 +21,8 @@ hparams = tf.contrib.training.HParams(
     # **NOTE**: if you change the one of the two parameters below, you need to
     # re-run preprocessing before training.
     # **NOTE**: scaler input (raw or mulaw) is experimental. Use it your own risk.
-    input_type="raw",
-    quantize_channels=65536,  # 65536 or 256
+    input_type="mulaw",
+    quantize_channels=256,  # 65536 or 256
 
     # Audio:
     sample_rate=22050,
@@ -82,7 +82,7 @@ hparams = tf.contrib.training.HParams(
 
     # Data loader
     pin_memory=True,
-    num_workers=2,
+    num_workers=4,
 
     # train/test
     # test size can be specified as portion or num samples
@@ -93,7 +93,7 @@ hparams = tf.contrib.training.HParams(
     # Loss
 
     # Training:
-    batch_size=2,
+    batch_size=4,
     adam_beta1=0.9,
     adam_beta2=0.999,
     adam_eps=1e-8,

@@ -899,7 +899,7 @@ def get_data_loaders(data_root, speaker_id, num_replicas, rank, test_shuffle=Tru
 
         data_loader = data_utils.DataLoader(
             dataset, batch_size=hparams.batch_size,
-            num_workers=0, sampler=sampler, shuffle=shuffle,
+            num_workers=hparams.num_workers, sampler=sampler, shuffle=shuffle,
             collate_fn=collate_fn, pin_memory=hparams.pin_memory)
         speaker_ids = {}
 
